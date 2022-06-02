@@ -1,1 +1,214 @@
-dasdas
+# SPDX-FileCopyrightText: 2021 ladyada for Adafruit Industries
+# SPDX-License-Identifier: MIT
+
+# Simple GPS module demonstration.
+# Will wait for a fix and print a message every second with the current location
+# and other details.
+import time
+import board
+import busio
+import ssl
+import adafruit_ntp
+import rtc
+import wifi
+import socketpool
+import displayio
+import adafruit_requests
+import ipaddress
+import gc
+from adafruit_azureiot import IoTHubDevice
+
+import adafruit_gps
+from adafruit_lc709203f import LC709203F, PackSize
+import microcontroller
+
+
+
+#Create objectes from the battery classes so we can read the battery status
+battery_monitor = LC709203F(board.I2C())
+battery_monitor.pack_size = PackSize.MAH2000
+
+#set variable to false as we're checking if the WiFi is active.
+wificonnection = False
+
+#counter to track how much itterations we've done for debugging
+n=0 
+
+
+try: #Load the secrets class with the WiFi and Azure IoT secrets.
+    from secrets import secrets
+    
+except ImportError:
+        print("Ploppers! An error occured getting the Wifi detials")
+        raise
+
+
+def zeroadd(metric):
+    if (metric / 2) <= 5: #do this to ensure that there is always two digits
+        return '0'+ str(metric)
+    else:
+        return str(metric) #in this case the number has two digits, do nothing.
+
+def loadwifi():
+    #Load the assigned wifi for the use of connecting to Azure and other fun interweb things.
+    
+    for x in range(30): #trying three times
+        print("Connecting to the WiFi %s"%secrets["ssid-home"])
+        try:
+            wifi.radio.connect(secrets["ssid-home"], secrets["password-home"])
+        except:
+            print("Inital WiFi connnection failed. Retrying...")
+        else:
+            print("Connected to Wifi %s!"%secrets["ssid-home"])
+     #       wificonnection = True
+            return  
+        
+    print("Ploppers! Couldn't connect to %s"%secrets["ssid-home"])
+    print("Exiting please check your wifi and try again later.")
+   # wificonnection = False
+    return
+
+
+
+def pingtest():
+    try:
+        ipv4 = ipaddress.ip_address("8.8.4.4")
+        print("Ping google.com: %f ms" % (wifi.radio.ping(ipv4)*1000))
+        return True
+    except:
+        print("No internet / ip address.")
+        return False
+
+
+# Create a serial connection for the GPS connection using default speed and
+# a slightly higher timeout (GPS modules typically update once a second).
+# These are the defaults you should use for the GPS FeatherWing.
+uart = busio.UART(board.TX, board.RX, baudrate=9600, timeout=10)
+
+# If using I2C, we'll create an I2C interface to talk to using default pins
+i2c = board.I2C()
+
+# Create a GPS module instance.
+#gps = adafruit_gps.GPS_GtopI2C(i2c, debug=False)  # Use I2C interface
+gps = adafruit_gps.GPS_GtopI2C(i2c)  # Use I2C interface
+
+# the GPS module behavior:
+#   https://cdn-shop.adafruit.com/datasheets/PMTK_A11.pdf
+
+# Turn on the basic GGA and RMC info (what you typically want)
+gps.send_command(b"PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0")
+
+# Set update rate to once a second (1hz) which is what you typically want.
+gps.send_command(b"PMTK220,1000")
+# Or decrease to once every two seconds by doubling the millisecond value.
+# This was 1000ms and changed now to 6000ms 
+#Be sure to also increase your UART timeout above!
+
+# Main loop runs forever printing the location, etc. every second.
+last_print = time.monotonic()
+payload_long = [] #this is a list to hold the GPS payload detials
+
+
+loadwifi()
+
+if time.localtime().tm_year < 2022:
+    print("Setting System Time in UTC")
+    pool = socketpool.SocketPool(wifi.radio)
+    ntp = adafruit_ntp.NTP(pool, tz_offset=-4)
+    # NOTE: This changes the system time so make sure you aren't assuming that time
+    # doesn't jump.
+    rtc.RTC().datetime = ntp.datetime
+
+try:
+    pool = socketpool.SocketPool(wifi.radio)
+    esp = None
+    device = IoTHubDevice(pool, esp, secrets["device_connection_string"])
+    device.connect()
+except:
+    print("Error connecting to Azure IOT Hub.")
+
+while True:
+    gps.update()
+    # Every second print out current location details if there's a fix.
+    current = time.monotonic()
+
+    if current - last_print >= 1.0:
+       
+      
+        print("-"*30)            
+        print(str(n))
+        print("Battery  : {:.1f} %".format(battery_monitor.cell_percent))
+        print("Battery  : {:.2f} V".format(battery_monitor.cell_voltage))
+        #print("CPU Temp : {:.1f} C".format(microcontroller.cpu.temperature))
+        print("My IP    :", wifi.radio.ipv4_address)
+        print("Locations: " + str(len(payload_long)))
+        print("Sat'     : {}".format(gps.satellites))
+        gc.collect()
+        start_mem = gc.mem_free()
+        print( "Memory  : {} bytes".format(start_mem) ) 
+        pingtest()
+      
+
+
+        
+        last_print = current
+        
+        if not gps.has_fix:
+            # Try again if we don't have a fix yet.
+            print("Waiting for satellite fix...")
+            continue
+        # We have a fix! (gps.has_fix is true)
+      
+        #below is the creation of the GPS payload i.e. the location and some
+        #more data points. Function zeroadd() checks is an int is a single or
+        #double digit and adds a leading zero in case of single digit.
+        #Constant lenght of numbers make the string extraction more predicatable
+        payload = "*"
+        payload += zeroadd(gps.timestamp_utc.tm_mon)
+        payload += zeroadd(gps.timestamp_utc.tm_mday)
+        payload += zeroadd(gps.timestamp_utc.tm_year)
+        payload += zeroadd(gps.timestamp_utc.tm_hour)
+        payload += zeroadd(gps.timestamp_utc.tm_min)
+        payload += zeroadd(gps.timestamp_utc.tm_sec)
+        payload += ","
+        payload += "{:.5f}".format(gps.latitude)     
+        payload += ","
+        payload += "{:.5f}".format(gps.longitude)
+    
+        if gps.altitude_m is not None:
+            
+            payload += ",{:.0f}".format(gps.altitude_m)
+        else:
+            payload += ",na"
+              
+        if gps.satellites is not None:
+            payload+="," + str(gps.satellites)
+        else:
+            payload += ",ns"
+        
+      
+        if gps.speed_knots is not None:
+            payload += ",{:.0f}".format(gps.speed_knots)
+        else:
+            payload += ",nk"
+        
+        print(payload)
+  
+        payload_long.append(payload)
+        
+        if n >= 10:
+            for y in payload_long:
+                device.send_device_to_cloud_message(y)   
+            n=0
+            payload_long.clear()
+         
+        n+=1        
+
+     #   print("Current Payload:" + payload)
+       
+       
+        
+        
+            
+            
+            
