@@ -7,20 +7,23 @@
 import time
 import board
 import busio
-import ssl
+#import ssl
 import adafruit_ntp
 import rtc
 import wifi
 import socketpool
-import displayio
-import adafruit_requests
+#import displayio
+#import adafruit_requests
 import ipaddress
-import gc
+#import gc
+from adafruit_lsm6ds.ism330dhcx import ISM330DHCX
 from adafruit_azureiot import IoTHubDevice
 
 import adafruit_gps
 from adafruit_lc709203f import LC709203F, PackSize
 import microcontroller
+
+
 
 
 
@@ -51,23 +54,46 @@ def zeroadd(metric):
 
 def loadwifi():
     #Load the assigned wifi for the use of connecting to Azure and other fun interweb things.
-    
-    for x in range(5): #trying three times
+    pool = None
+    wifi.radio.enabled = False
+    wifi.radio.enabled = True
+    for x in range(5): #trying Five times
         print("Connecting to the WiFi %s"%secrets["ssid"])
         try:
             wifi.radio.connect(secrets["ssid"], secrets["password"])
+            pool = socketpool.SocketPool(wifi.radio)
+            if time.localtime().tm_year < 2022:
+                print("Setting System Time in UTC")
+                ntp = adafruit_ntp.NTP(pool, tz_offset=-4)
+                # NOTE: This changes the system time so make sure you aren't assuming that time
+                # doesn't jump.
+                rtc.RTC().datetime = ntp.datetime
+                         
         except:
             print("Inital WiFi connnection failed. Retrying...")
         else:
             print("Connected to Wifi %s!"%secrets["ssid"])
-     #       wificonnection = True
-            return  
+            return pool
         
-    print("Ploppers! Couldn't connect to %s"%secrets["ssid-home"])
+    print("Ploppers! Couldn't connect to %s"%secrets["ssid"])
     print("Exiting please check your wifi and try again later.")
-   # wificonnection = False
-    return
+    return False
 
+
+def loadazure(pool):
+    for x in range(3): #trying three times
+        esp = None
+        try:
+            device = IoTHubDevice(pool, esp, secrets["device_connection_string"])
+        except:
+            print("Error connecting to Azure IOT Hub. Retrying...")
+        else:
+            device.connect()
+            print("Successfull connected to Azure")
+        return device
+    print("Cannot connect to Azure.")
+    print("Exiting please check your wifi and try again later.")
+    return False
 
 
 def pingtest():
@@ -87,6 +113,7 @@ uart = busio.UART(board.TX, board.RX, baudrate=9600, timeout=10)
 
 # If using I2C, we'll create an I2C interface to talk to using default pins
 i2c = board.I2C()
+sensor = ISM330DHCX(i2c)
 
 # Create a GPS module instance.
 #gps = adafruit_gps.GPS_GtopI2C(i2c, debug=False)  # Use I2C interface
@@ -109,33 +136,18 @@ last_print = time.monotonic()
 payload_long = [] #this is a list to hold the GPS payload detials
 
 
-loadwifi()
-
-if time.localtime().tm_year < 2022:
-    print("Setting System Time in UTC")
-    pool = socketpool.SocketPool(wifi.radio)
-    ntp = adafruit_ntp.NTP(pool, tz_offset=-4)
-    # NOTE: This changes the system time so make sure you aren't assuming that time
-    # doesn't jump.
-    rtc.RTC().datetime = ntp.datetime
-
-try:
-    pool = socketpool.SocketPool(wifi.radio)
-    esp = None
-    device = IoTHubDevice(pool, esp, secrets["device_connection_string"])
-    device.connect()
-except:
-    print("Error connecting to Azure IOT Hub.")
-
+networkpool = loadwifi()
+if not networkpool is False:
+    device = loadazure(networkpool)
+    
 while True:
+    
     gps.update()
     # Every second print out current location details if there's a fix.
     current = time.monotonic()
 
     if current - last_print >= 1.0:
-      
-
-        
+              
         last_print = current
         
         if not gps.has_fix:
@@ -177,53 +189,46 @@ while True:
         else:
             payload += ",nk"
         
+        payload += "," + str(sensor.acceleration)
+        
         print(payload)
   
         payload_long.append(payload)
-        n+=1 
+        n+=1
         
         print("-"*30)            
         print(str(n))
         print("Battery  : {:.1f} %".format(battery_monitor.cell_percent))
         print("Battery  : {:.2f} V".format(battery_monitor.cell_voltage))
         #print("CPU Temp : {:.1f} C".format(microcontroller.cpu.temperature))
-        print("My IP    :", wifi.radio.ipv4_address)
+        #print("My IP    :", wifi.radio.ipv4_address)
         print("Locations: " + str(len(payload_long)))
         print("Sat'     : {}".format(gps.satellites))
-        gc.collect()
-        start_mem = gc.mem_free()
-        print( "Memory  : {} bytes".format(start_mem) ) 
-        pingtest()
-        
-        if n >= 10: 
-            for y in payload_long:
-                try:
-                    device.send_device_to_cloud_message(y)
-                except:
-                    print("!!!Connection error, reconnecting to Wifi")
-                    try:       
-                        wifi.radio.connect(secrets["ssid"], secrets["password"])
-                    except:
-                        print("Cannot reload wifi. Skipping")
-                        n = -10
-                        break
+        #gc.collect()
+        #start_mem = gc.mem_free()
+        #print( "Memory  : {} bytes".format(start_mem) ) 
+        #try:
+        #    pingtest()
+        #except Exception as e:
+        #        print("Ping test error" + str(e))
+    
+        if n >= 100: 
+            if pingtest():
+                for y in range(0,len(payload_long),20):
+                    print("Thzee number is:" + str(y))
                     try:
-                        device.reconnect()
-                        print("Successfully reconnected to Azure")
-                    except:
-                        print("Cannot Reconnect to Azure")
-                        n = -10 #making the counter longer so that we give the internet time
-                        break
-                   
-            if n==10:      
-                n=0
-                payload_long.clear()
-
-                
-                
-           
-     
-        
-               
-
-     #   print("Current Payload:" + payload)
+                        device.send_device_to_cloud_message(payload_long[y])
+                    except Exception as e:
+                        print("!!Connection error:" + str(e))     
+                        try: 
+                            device = loadazure(networkpool)
+                        except Exception as e:
+                            print("!!!issues with reloading Azure:"+str(e))
+                            n=-100
+                            device = None
+    
+            else:
+                n=-100                                 
+        if n==100:
+            n=0
+            payload_long.clear()
