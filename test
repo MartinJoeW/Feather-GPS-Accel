@@ -1,141 +1,246 @@
-# SPDX-FileCopyrightText: 2021 ladyada for Adafruit Industries
-# SPDX-License-Identifier: MIT
-
-# Simple GPS module demonstration.
-# Will wait for a fix and print a message every second with the current location
-# and other details.
 import time
 import board
-import busio
-import ssl
 import adafruit_ntp
 import rtc
 import wifi
 import socketpool
-import displayio
-import adafruit_requests
-import ipaddress
-import gc
+import os
+from adafruit_lsm6ds.ism330dhcx import ISM330DHCX
 from adafruit_azureiot import IoTHubDevice
+import gc
+
+
+#import digitalio
+import storage
+import sdcardio
+
 
 import adafruit_gps
 from adafruit_lc709203f import LC709203F, PackSize
 import microcontroller
 
-
-
 #Create objectes from the battery classes so we can read the battery status
+#Our battery size is available so we took the closest to our size.
 battery_monitor = LC709203F(board.I2C())
 battery_monitor.pack_size = PackSize.MAH500
 
-#set variable to false as we're checking if the WiFi is active.
-wificonnection = False
-
-#counter to track how much itterations we've done for debugging
-n=0 
 
 
-try: #Load the secrets class with the WiFi and Azure IoT secrets.
-    from secrets import secrets
+def loadfs():
+    #Load the file system to write the the SD card
+    # Use the board's primary SPI bus
+    spi = board.SPI()
+
+    # For breakout boards, you can choose any GPIO pin that's convenient:
+    cs = board.D10
+    sdcard = sdcardio.SDCard(spi, cs)
+    vfs = storage.VfsFat(sdcard)
+    storage.mount(vfs, "/sd")
+    print("Success - Loaded the filesystem")
+    return
     
-except ImportError:
-        print("Ploppers! An error occured getting the Wifi detials")
-        raise
+
+def writefile(payload=1, how="a"):
+    print("Status - Attempting to write to file")
+    try:
+        for y in range(0,len(payload)):
+            with open("/sd/testv2.txt", how) as f:
+                f.write(payload[y])
+                print("Success - wrote:"+payload[y])
+    except:
+        print("Fail - Cannot write to file") 
+    return
+
+
+def checkfile():
+  
+    try:
+        #14kB is the size of the file with only a single header.
+        if (os.stat("/sd/testv2.txt")[6]>20):
+            print("Status - File size implies previous data : "+ "{:,} Bytes".format(os.stat("/sd/testv2.txt")[6]))
+        '''
+            with open("/sd/testv2.txt", "r") as f:
+                print("Printing lines in file:")
+                line = f.readline(64000)
+                while line != '':
+                    n+=1
+                    #print(str(n)+": "+ line)
+                    line = f.readline(64000) 
+                    '''
+        return True
+    except:
+        print("File does not exist or is too small to hold data")
+        return False
+
+
+def loadgps():
+    #load the GPS unit and functions. Critical for the logging
+    #Create a serial connection for the GPS connection using default speed and
+    #a slightly higher timeout (GPS modules typically update once a second).
+    #These are the defaults you should use for the GPS FeatherWing.
+    #uart = busio.UART(board.TX, board.RX, baudrate=9600, timeout=10)
+    
+    # If using I2C, we'll create an I2C interface to talk to using default pins
+    i2c = board.I2C()
+    
+    # Create a GPS module instance.
+    #gps = adafruit_gps.GPS_GtopI2C(i2c, debug=False)  # Use I2C interface
+    gps = adafruit_gps.GPS_GtopI2C(i2c)  # Use I2C interface
+    
+    # the GPS module behavior:
+    #   https://cdn-shop.adafruit.com/datasheets/PMTK_A11.pdf
+    
+    # Turn on the basic GGA and RMC info (what you typically want)
+    gps.send_command(b"PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0")
+    
+    # Set update rate to once a second (1hz) which is what you typically want.
+    gps.send_command(b"PMTK220,1000")
+    # Or decrease to once every two seconds by doubling the millisecond value.
+    # This was 1000ms and changed now to 6000ms 
+    # Be sure to also increase your UART timeout above!
+    
+    # Main loop runs forever printing the location, etc. every second.
+    last_print = time.monotonic()
+    return gps, last_print
+
+
+def loadaccelerometer():
+    #loads the accelerometer
+    i2c = board.I2C()
+    sensor = ISM330DHCX(i2c)
+    return sensor
+
+
+def connectwifi(secrets):
+    #Load the assigned wifi for the use of connecting to Azure and other fun interweb things.
+    for x in range(5): #trying Five times
+        pool = None
+        wifi.radio.enabled = False
+        wifi.radio.enabled = True
+        print("Status - Connecting to the WiFi %s"%secrets["ssid-home"])
+        try:
+            wifi.radio.connect(secrets["ssid-home"], secrets["password-home"])
+            pool = socketpool.SocketPool(wifi.radio)
+            if time.localtime().tm_year < 2022:
+                print("Status - Setting System Time in UTC")
+                ntp = adafruit_ntp.NTP(pool, tz_offset=-4)
+                # NOTE: This changes the system time so make sure you aren't assuming that time
+                # doesn't jump.
+                rtc.RTC().datetime = ntp.datetime
+            print("Success - Connected to Wifi %s!"%secrets["ssid-home"])
+            return pool    
+            
+        except:
+            print("Error - Inital WiFi connnection failed. Retrying "+str(4-x)+" more times.")
+            print ("Waiting for "+str(x+1)+" seconds")
+            time.sleep(float(x+1))
+              
+    print("Fail - Couldn't connect to %s"%secrets["ssid-home"])
+    print("Fail - Please check your wifi and try again later.")  
+    return False
+
+def connectazure(pool):
+    #connects to the IOT Hub in Azure
+    for x in range(3): #trying three times
+        esp = None
+        try:
+            device = IoTHubDevice(pool, esp, secrets["device_connection_string"])
+        except:
+            print("Error - Cannot reach Azure IOT Hub. Retrying...")
+           
+        else:
+            try:
+                device.connect()
+                print("Success - Connected to Azure")
+                return device
+            except:
+                print("Error - Error in connecting to IOT Hub")
+    print("Fail - Cannot connect to Azure.")
+    print("Fail - Exiting please check your wifi and try again later.")
+    return False
+
+
+def uploadpayload(device, datafile=["Foo bar","drie bier"]):
+    #uploads the payload (from file in SD card) into Azure.
+   
+       #have to read line by line in order to get all detials and not run into mem issues
+       #the a memory in bytes for read size is critical! Otherwise we run out of memory.
+       #it's reocmmended not to go over 64000 as the system will run out of mem.
+       with open("/sd/testv2.txt", "r") as f:
+            line = f.readline(64000)
+            while line != '':
+                try:
+                    device.send_device_to_cloud_message(line)
+                    print(line)
+                except:
+                    print("Fail - Upload of data line failed.")
+                line = f.readline(64000)          
+            return True
 
 
 def zeroadd(metric):
-    if (metric / 2) <= 5: #do this to ensure that there is always two digits
+    if (metric / 2) < 5: #do this to ensure that there is always two digits
         return '0'+ str(metric)
     else:
         return str(metric) #in this case the number has two digits, do nothing.
 
-def loadwifi():
-    #Load the assigned wifi for the use of connecting to Azure and other fun interweb things.
-    
-    for x in range(5): #trying three times
-        print("Connecting to the WiFi %s"%secrets["ssid"])
-        try:
-            wifi.radio.connect(secrets["ssid"], secrets["password"])
-        except:
-            print("Inital WiFi connnection failed. Retrying...")
-        else:
-            print("Connected to Wifi %s!"%secrets["ssid"])
-     #       wificonnection = True
-            return  
+
+def loadsecrets():
+    #Load the secrets class with the WiFi and Azure IoT secrets.
+    try: 
+        from secrets import secrets
+        print("Success - Loaded the Secrets Details")
+        return secrets
         
-    print("Ploppers! Couldn't connect to %s"%secrets["ssid-home"])
-    print("Exiting please check your wifi and try again later.")
-   # wificonnection = False
-    return
-
-
-
-def pingtest():
-    try:
-        ipv4 = ipaddress.ip_address("8.8.4.4")
-        print("Ping google.com: %f ms" % (wifi.radio.ping(ipv4)*1000))
-        return True
     except:
-        print("No internet / ip address.")
-        return False
+        print("Fail - Cannot load Secrets")
+
+        
+#-------------MAIN PART OF THE CODE STARTS HERE----------------
+#Load the secrets for Wifi and Azure
+secrets = loadsecrets()
+
+#Load the file system detials
+loadfs()
 
 
-# Create a serial connection for the GPS connection using default speed and
-# a slightly higher timeout (GPS modules typically update once a second).
-# These are the defaults you should use for the GPS FeatherWing.
-uart = busio.UART(board.TX, board.RX, baudrate=9600, timeout=10)
+if checkfile() is True:
+    
+    #Attempt to connect to the wifi. If true, we're trying to
+    print("Status - Connecting to Wifi")
+    networkpool = connectwifi(secrets)
+    print("Network pool: " +str(networkpool))
+          
+    if networkpool is not False:
+        print("Success - Connected to Wifi. Attempting to connect to Azure")    
+        device = connectazure(networkpool)
+        
+        if device is not False:
+            print("Status - Time to upload sjit to Azure")  
+            uploadpayload(device)
+            #writefile(1,"w") 
+        else:
+            print("Fail - Cannot connect to Azure")
+    else:
+        print("Fail - Cannot connect to Wifi and therefore not to Azure")
+        
+gps, last_print = loadgps()
+sensor = loadaccelerometer()
 
-# If using I2C, we'll create an I2C interface to talk to using default pins
-i2c = board.I2C()
+gpscounter = 0
+payload_long = []   
 
-# Create a GPS module instance.
-#gps = adafruit_gps.GPS_GtopI2C(i2c, debug=False)  # Use I2C interface
-gps = adafruit_gps.GPS_GtopI2C(i2c)  # Use I2C interface
-
-# the GPS module behavior:
-#   https://cdn-shop.adafruit.com/datasheets/PMTK_A11.pdf
-
-# Turn on the basic GGA and RMC info (what you typically want)
-gps.send_command(b"PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0")
-
-# Set update rate to once a second (1hz) which is what you typically want.
-gps.send_command(b"PMTK220,1000")
-# Or decrease to once every two seconds by doubling the millisecond value.
-# This was 1000ms and changed now to 6000ms 
-#Be sure to also increase your UART timeout above!
-
-# Main loop runs forever printing the location, etc. every second.
-last_print = time.monotonic()
-payload_long = [] #this is a list to hold the GPS payload detials
-
-
-loadwifi()
-
-if time.localtime().tm_year < 2022:
-    print("Setting System Time in UTC")
-    pool = socketpool.SocketPool(wifi.radio)
-    ntp = adafruit_ntp.NTP(pool, tz_offset=-4)
-    # NOTE: This changes the system time so make sure you aren't assuming that time
-    # doesn't jump.
-    rtc.RTC().datetime = ntp.datetime
-
-try:
-    pool = socketpool.SocketPool(wifi.radio)
-    esp = None
-    device = IoTHubDevice(pool, esp, secrets["device_connection_string"])
-    device.connect()
-except:
-    print("Error connecting to Azure IOT Hub.")
+#Write a single demarc the start of this logging session.
+writefile(["$Start,"+str(time.monotonic())+"$\n"],"a")
 
 while True:
-    gps.update()
+    
     # Every second print out current location details if there's a fix.
+    gps.update()
+    
     current = time.monotonic()
 
     if current - last_print >= 1.0:
-      
-
-        
         last_print = current
         
         if not gps.has_fix:
@@ -143,11 +248,7 @@ while True:
             print("Waiting for satellite fix...")  
             continue
         # We have a fix! (gps.has_fix is true)
-      
-        #below is the creation of the GPS payload i.e. the location and some
-        #more data points. Function zeroadd() checks is an int is a single or
-        #double digit and adds a leading zero in case of single digit.
-        #Constant lenght of numbers make the string extraction more predicatable
+       
         payload = "*"
         payload += zeroadd(gps.timestamp_utc.tm_mon)
         payload += zeroadd(gps.timestamp_utc.tm_mday)
@@ -159,71 +260,41 @@ while True:
         payload += "{:.5f}".format(gps.latitude)     
         payload += ","
         payload += "{:.5f}".format(gps.longitude)
-    
+   
         if gps.altitude_m is not None:
-            
             payload += ",{:.0f}".format(gps.altitude_m)
         else:
             payload += ",na"
               
+            
         if gps.satellites is not None:
             payload+="," + str(gps.satellites)
         else:
             payload += ",ns"
         
-      
         if gps.speed_knots is not None:
             payload += ",{:.0f}".format(gps.speed_knots)
         else:
             payload += ",nk"
         
-        print(payload)
-  
+        payload += "," + str(sensor.acceleration)
+        payload +="," + str(battery_monitor.cell_percent)
+        payload +="," + str(battery_monitor.cell_voltage)
+        payload +="," + str(microcontroller.cpu.temperature)
+        payload +="," + str(gc.mem_free())
+        payload +="\n"
         payload_long.append(payload)
-        n+=1 
+        gpscounter+=1
         
-        print("-"*30)            
-        print(str(n))
+        print("-"*30)   
+        print(payload)            
         print("Battery  : {:.1f} %".format(battery_monitor.cell_percent))
         print("Battery  : {:.2f} V".format(battery_monitor.cell_voltage))
-        #print("CPU Temp : {:.1f} C".format(microcontroller.cpu.temperature))
-        print("My IP    :", wifi.radio.ipv4_address)
-        print("Locations: " + str(len(payload_long)))
-        print("Sat'     : {}".format(gps.satellites))
-        gc.collect()
-        start_mem = gc.mem_free()
-        print( "Memory  : {} bytes".format(start_mem) ) 
-        pingtest()
+        print("CPU Temp : {:.1f} C".format(microcontroller.cpu.temperature))
+        print("Mem Free : {:,} kB".format(gc.mem_free()))
+        print(gpscounter)
         
-        if n >= 10: 
-            for y in payload_long:
-                try:
-                    device.send_device_to_cloud_message(y)
-                except:
-                    print("!!!Connection error, reconnecting to Wifi")
-                    try:       
-                        wifi.radio.connect(secrets["ssid"], secrets["password"])
-                    except:
-                        print("Cannot reload wifi. Skipping")
-                        n = -10
-                        break
-                    try:
-                        device.reconnect()
-                        print("Successfully reconnected to Azure")
-                    except:
-                        print("Cannot Reconnect to Azure")
-                        n = -10 #making the counter longer so that we give the internet time
-                        break
-                   
-            if n==10:      
-                n=0
-                payload_long.clear()
-
-                
-                
-           
-     
-        
-               
-
-     #   print("Current Payload:" + payload)
+        if gpscounter>=10:
+            writefile(payload_long) 
+            payload_long.clear()
+            gpscounter=0
